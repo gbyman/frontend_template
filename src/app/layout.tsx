@@ -1,6 +1,15 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Script from "next/script";
+import GlobalSpinner from "@/components/GlobalSpinner";
+import { API } from "@/constants/constants";
+import AntdProvider from "@/providers/AntdProvider";
+import QueryProvider from "@/providers/QueryProvider";
 import "./globals.css";
+// 알림(toast)은 Antd notification/message API를 사용합니다.
+// react-toastify가 설치되어 있으므로 필요 시 아래 코드로 대체 가능합니다.
+// import { ToastContainer } from "react-toastify";
+// <ToastContainer autoClose={2000} position="top-right" closeOnClick pauseOnHover />
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -24,8 +33,17 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+        {/* 로컬 개발 환경 제외하고 Docker 런타임 환경변수 주입 */}
+        {process.env.NODE_ENV === "production" && (
+          <Script src={API.RUNTIME_ENV_CONFIG_PATH} strategy="beforeInteractive" />
+        )}
+      </head>
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
-        {children}
+        <AntdProvider>
+          <QueryProvider>{children}</QueryProvider>
+          <GlobalSpinner />
+        </AntdProvider>
       </body>
     </html>
   );

@@ -1,0 +1,385 @@
+# ============================================
+# GitHub Actions CI/CD Pipeline
+# ============================================
+#
+# 파이프라인: build + test (병렬) → docker → deploy
+#
+# 브랜치 전략:
+#   develop     → dev 환경 배포
+#   release/*   → stg 환경 배포
+#   main        → prod 환경 배포
+#   PR          → build + test만 실행
+#
+# 필수 Secrets (Settings → Secrets and variables → Actions):
+#   REGISTRY_URL / REGISTRY_USERNAME / REGISTRY_PASSWORD
+#
+# 선택 Secrets (SonarQube):
+#   SONAR_HOST_URL / SONAR_TOKEN / SONAR_PROJECT_KEY / SONAR_PROJECT_NAME
+#
+# 환경별 Secrets (Settings → Environments → [환경] → Secrets):
+#   {ENV}_SERVER_HOST / {ENV}_SERVER_USER / {ENV}_SERVER_SSH_KEY
+#   {ENV}_DEPLOY_PATH
+#   (ENV = DEV, STG, PROD)
+#
+# 운영 배포 수동 승인 설정:
+#   Settings → Environments → production → Required reviewers 추가
+# ============================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  APP_IMAGE: ${{ secrets.REGISTRY_URL }}/frontend-app
+
+jobs:
+  # ============================================
+  # 빌드 (Next.js standalone)
+  # ============================================
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextjs-build
+          path: |
+            .next/standalone/
+            .next/static/
+            public/
+          retention-days: 1
+
+  # ============================================
+  # 테스트 및 코드 품질 (build와 병렬 실행)
+  # ============================================
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write         # dorny/test-reporter가 Check Run 생성에 필요
+      pull-requests: write  # PR에 테스트 결과 코멘트 작성에 필요
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm run test:run -- --reporter=junit --outputFile=test-results/junit.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            test-results/
+            coverage/
+          retention-days: 7
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Vitest Results
+          path: 'test-results/junit.xml'
+          reporter: java-junit
+
+  # ============================================
+  # SonarQube 분석 (선택 - SONAR_HOST_URL 설정 시만 실행)
+  # ============================================
+  sonarqube:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check SonarQube configuration
+        id: sonar-check
+        run: |
+          if [ -z "${{ secrets.SONAR_HOST_URL }}" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: SonarQube Scan
+        if: steps.sonar-check.outputs.skip == 'false'
+        uses: sonarsource/sonarqube-scan-action@v4
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.projectName=${{ secrets.SONAR_PROJECT_NAME }}
+            -Dsonar.sources=src
+            -Dsonar.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx,**/node_modules/**
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.sourceEncoding=UTF-8
+
+  # ============================================
+  # Docker 이미지 빌드 & Push
+  # ============================================
+  docker:
+    needs: [ build, test ]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.REGISTRY_URL }}/frontend-app
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================
+  # 개발 환경 배포
+  # ============================================
+  deploy-dev:
+    needs: docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: development
+      url: https://dev.example.com
+
+    steps:
+      - name: Deploy to Dev Server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEV_SERVER_HOST }}
+          username: ${{ secrets.DEV_SERVER_USER }}
+          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+          script: |
+            set -e
+
+            IMAGE_TAG=${{ github.sha }}
+            SHORT_SHA=${IMAGE_TAG:0:7}
+
+            docker login -u ${{ secrets.REGISTRY_USERNAME }} \
+              -p ${{ secrets.REGISTRY_PASSWORD }} \
+              ${{ secrets.REGISTRY_URL }}
+
+            docker pull ${{ env.APP_IMAGE }}:${SHORT_SHA}
+
+            cd ${{ secrets.DEV_DEPLOY_PATH }}
+            export APP_IMAGE=${{ env.APP_IMAGE }}
+            export IMAGE_TAG=${SHORT_SHA}
+            docker compose -f docker-compose.prod.yml up -d --force-recreate
+
+            docker image prune -f
+
+            echo "Dev 배포 완료: ${SHORT_SHA}"
+
+  # ============================================
+  # 스테이징 환경 배포
+  # ============================================
+  deploy-stg:
+    needs: docker
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/')
+    environment:
+      name: staging
+      url: https://stg.example.com
+
+    steps:
+      - name: Deploy to Staging Server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STG_SERVER_HOST }}
+          username: ${{ secrets.STG_SERVER_USER }}
+          key: ${{ secrets.STG_SERVER_SSH_KEY }}
+          script: |
+            set -e
+
+            IMAGE_TAG=${{ github.sha }}
+            SHORT_SHA=${IMAGE_TAG:0:7}
+
+            docker login -u ${{ secrets.REGISTRY_USERNAME }} \
+              -p ${{ secrets.REGISTRY_PASSWORD }} \
+              ${{ secrets.REGISTRY_URL }}
+
+            docker pull ${{ env.APP_IMAGE }}:${SHORT_SHA}
+
+            cd ${{ secrets.STG_DEPLOY_PATH }}
+            export APP_IMAGE=${{ env.APP_IMAGE }}
+            export IMAGE_TAG=${SHORT_SHA}
+            docker compose -f docker-compose.prod.yml up -d --force-recreate
+
+            docker image prune -f
+
+            echo "Staging 배포 완료: ${SHORT_SHA}"
+
+  # ============================================
+  # 운영 환경 배포
+  # ============================================
+  # 수동 승인: Settings → Environments → production → Required reviewers 추가
+  deploy-prod:
+    needs: docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://example.com
+
+    steps:
+      - name: Deploy to Production Server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_SERVER_HOST }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          key: ${{ secrets.PROD_SERVER_SSH_KEY }}
+          script: |
+            set -e
+
+            IMAGE_TAG=${{ github.sha }}
+            SHORT_SHA=${IMAGE_TAG:0:7}
+
+            docker login -u ${{ secrets.REGISTRY_USERNAME }} \
+              -p ${{ secrets.REGISTRY_PASSWORD }} \
+              ${{ secrets.REGISTRY_URL }}
+
+            docker pull ${{ env.APP_IMAGE }}:${SHORT_SHA}
+
+            cd ${{ secrets.PROD_DEPLOY_PATH }}
+            export APP_IMAGE=${{ env.APP_IMAGE }}
+            export IMAGE_TAG=${SHORT_SHA}
+            docker compose -f docker-compose.prod.yml up -d --force-recreate
+
+            docker image prune -f
+
+            echo "Production 배포 완료: ${SHORT_SHA}"
+
+  # ============================================
+  # (대안) 파일 전달 기반 배포
+  # ============================================
+  # Docker 대신 Next.js standalone 빌드 결과물을 직접 배포하는 방식.
+  # 아래 주석을 해제하고, 위의 Docker 배포 섹션을 주석 처리하여 사용.
+  # 대상 서버에 Node.js 22+ 와 pm2가 설치되어 있어야 한다.
+  #
+  # 추가 Secrets 필요:
+  #   DEV_API_BASE_URL / STG_API_BASE_URL / PROD_API_BASE_URL
+  #
+  # deploy-dev-files:
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   if: github.ref == 'refs/heads/develop'
+  #   environment:
+  #     name: development
+  #     url: https://dev.example.com
+  #
+  #   steps:
+  #     - name: Download build artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: nextjs-build
+  #
+  #     - name: Deploy files to Dev Server
+  #       uses: appleboy/ssh-action@v1
+  #       with:
+  #         host: ${{ secrets.DEV_SERVER_HOST }}
+  #         username: ${{ secrets.DEV_SERVER_USER }}
+  #         key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+  #         script: |
+  #           set -e
+  #           BACKUP_DIR="${{ secrets.DEV_DEPLOY_PATH }}/backup/$(date +%Y%m%d_%H%M%S)"
+  #           mkdir -p ${BACKUP_DIR}
+  #           cp -r ${{ secrets.DEV_DEPLOY_PATH }}/app/. ${BACKUP_DIR}/ 2>/dev/null || true
+  #           cd ${{ secrets.DEV_DEPLOY_PATH }}/backup && ls -dt */ | tail -n +6 | xargs rm -rf 2>/dev/null || true
+  #
+  #     - name: Transfer build files
+  #       uses: appleboy/scp-action@v0.1.7
+  #       with:
+  #         host: ${{ secrets.DEV_SERVER_HOST }}
+  #         username: ${{ secrets.DEV_SERVER_USER }}
+  #         key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+  #         source: "standalone/,static/,public/"
+  #         target: ${{ secrets.DEV_DEPLOY_PATH }}/app
+  #
+  #     - name: Restart service
+  #       uses: appleboy/ssh-action@v1
+  #       with:
+  #         host: ${{ secrets.DEV_SERVER_HOST }}
+  #         username: ${{ secrets.DEV_SERVER_USER }}
+  #         key: ${{ secrets.DEV_SERVER_SSH_KEY }}
+  #         script: |
+  #           set -e
+  #           cd ${{ secrets.DEV_DEPLOY_PATH }}/app/standalone
+  #           cp -r ../static .next/static
+  #           cp -r ../public public
+  #           export NEXT_PUBLIC_API_BASE_URL=${{ secrets.DEV_API_BASE_URL }}
+  #           export PORT=3000
+  #           pm2 restart frontend --update-env 2>/dev/null || pm2 start server.js --name frontend
+  #           pm2 save
+  #           sleep 5
+  #           curl -sf http://localhost:3000 || echo "WARNING: 헬스체크 실패"
+  #           echo "Dev 파일 배포 완료"
+  #
+  # deploy-stg-files: (동일 패턴, STG 변수 사용)
+  # deploy-prod-files: (동일 패턴, PROD 변수 사용)

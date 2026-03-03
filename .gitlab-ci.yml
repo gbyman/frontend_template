@@ -1,0 +1,307 @@
+# ============================================
+# GitLab CI/CD Pipeline
+# ============================================
+#
+# 파이프라인: build → test → docker → deploy
+#
+# 브랜치 전략:
+#   develop     → dev 환경 배포 (수동)
+#   release/*   → stg 환경 배포 (수동)
+#   main/master → prod 환경 배포 (수동)
+#   MR          → build + test만 실행
+#
+# 필수 CI/CD Variables (Settings → CI/CD → Variables):
+#   SSH_PRIVATE_KEY       - 배포 서버 SSH 개인키
+#   DEV_SERVER_HOST       - 개발 서버 호스트
+#   DEV_SERVER_USER       - 개발 서버 SSH 계정
+#   DEV_DEPLOY_PATH       - 개발 서버 배포 경로
+#   STG_SERVER_HOST/USER/DEPLOY_PATH - 스테이징 서버
+#   PROD_SERVER_HOST/USER/DEPLOY_PATH - 운영 서버
+#
+# 선택 CI/CD Variables:
+#   SONAR_HOST_URL        - SonarQube 서버 URL
+#   SONAR_TOKEN           - SonarQube 인증 토큰
+#   NEXT_PUBLIC_API_BASE_URL - 빌드타임 API URL (Docker 런타임 주입으로도 설정 가능)
+# ============================================
+
+stages:
+  - build
+  - test
+  - docker
+  - deploy-dev
+  - deploy-stg
+  - deploy-prod
+
+variables:
+  APP_IMAGE: "${CI_REGISTRY_IMAGE}"
+
+# MR 중복 파이프라인 방지
+# MR이 열린 브랜치는 MR 파이프라인만 실행하고, 브랜치 파이프라인은 실행하지 않음
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# npm 캐시 (브랜치별)
+cache: &npm-cache
+  key: "${CI_COMMIT_REF_SLUG}-npm"
+  paths:
+    - .npm/
+
+# ============================================
+# Build Stage
+# ============================================
+build:
+  stage: build
+  image: node:22-alpine
+  cache:
+    <<: *npm-cache
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run build
+  artifacts:
+    paths:
+      - .next/standalone/
+      - .next/static/
+      - public/
+    expire_in: 1 hour
+
+# ============================================
+# Test Stage
+# ============================================
+test:
+  stage: test
+  image: node:22-alpine
+  cache:
+    <<: *npm-cache
+    policy: pull
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run test:run
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 7 days
+
+# SonarQube 분석 (선택 - SONAR_HOST_URL 설정 시만 실행)
+sonarqube:
+  stage: test
+  image: sonarsource/sonar-scanner-cli:latest
+  allow_failure: true
+  script:
+    - >
+      sonar-scanner
+      -Dsonar.host.url=${SONAR_HOST_URL}
+      -Dsonar.login=${SONAR_TOKEN}
+      -Dsonar.projectKey=${SONAR_PROJECT_KEY:-${CI_PROJECT_PATH_SLUG}}
+      -Dsonar.projectName=${SONAR_PROJECT_NAME:-${CI_PROJECT_NAME}}
+      -Dsonar.sources=src
+      -Dsonar.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx,**/node_modules/**
+      -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+      -Dsonar.sourceEncoding=UTF-8
+  rules:
+    - if: $SONAR_HOST_URL && $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $SONAR_HOST_URL && $CI_COMMIT_BRANCH == "develop"
+
+# ============================================
+# Docker Stage
+# ============================================
+.docker-build:
+  stage: docker
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+
+docker:app:
+  extends: .docker-build
+  script:
+    - docker build
+        -t ${APP_IMAGE}:${CI_COMMIT_SHORT_SHA}
+        -t ${APP_IMAGE}:${CI_COMMIT_REF_SLUG}
+        .
+    - docker push ${APP_IMAGE}:${CI_COMMIT_SHORT_SHA}
+    - docker push ${APP_IMAGE}:${CI_COMMIT_REF_SLUG}
+
+# ============================================
+# Deploy Stage - Docker 기반 배포
+# ============================================
+# SSH Key 기반 인증으로 대상 서버에 접속하여 Docker Compose로 배포한다.
+# 대상 서버에 docker-compose.prod.yml과 .env 파일이 준비되어 있어야 한다.
+.deploy-docker:
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "${SSH_PRIVATE_KEY}" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H ${DEPLOY_HOST} >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} << ENDSSH
+        set -e
+
+        cd ${DEPLOY_PATH}
+
+        # 레지스트리 로그인
+        docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+
+        # 이미지 Pull
+        docker pull ${APP_IMAGE}:${IMAGE_TAG}
+
+        # docker-compose.prod.yml에서 사용할 이미지 태그 설정
+        export APP_IMAGE=${APP_IMAGE}
+        export IMAGE_TAG=${IMAGE_TAG}
+
+        # 배포
+        docker compose -f docker-compose.prod.yml up -d --force-recreate
+
+        # 미사용 이미지 정리
+        docker image prune -f
+
+        echo "배포 완료: ${APP_IMAGE}:${IMAGE_TAG}"
+      ENDSSH
+
+deploy:dev:
+  extends: .deploy-docker
+  stage: deploy-dev
+  when: manual
+  environment:
+    name: development
+    url: https://dev.example.com
+  variables:
+    DEPLOY_HOST: ${DEV_SERVER_HOST}
+    DEPLOY_USER: ${DEV_SERVER_USER}
+    DEPLOY_PATH: ${DEV_DEPLOY_PATH}
+    IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: manual
+
+deploy:stg:
+  extends: .deploy-docker
+  stage: deploy-stg
+  when: manual
+  environment:
+    name: staging
+    url: https://stg.example.com
+  variables:
+    DEPLOY_HOST: ${STG_SERVER_HOST}
+    DEPLOY_USER: ${STG_SERVER_USER}
+    DEPLOY_PATH: ${STG_DEPLOY_PATH}
+    IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+      when: manual
+
+deploy:prod:
+  extends: .deploy-docker
+  stage: deploy-prod
+  when: manual
+  environment:
+    name: production
+    url: https://example.com
+  variables:
+    DEPLOY_HOST: ${PROD_SERVER_HOST}
+    DEPLOY_USER: ${PROD_SERVER_USER}
+    DEPLOY_PATH: ${PROD_DEPLOY_PATH}
+    IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+      when: manual
+
+# ============================================
+# (대안) 파일 전달 기반 배포
+# ============================================
+# Docker 대신 Next.js standalone 빌드 결과물을 직접 배포하는 방식.
+# 아래 주석을 해제하고, 위의 Docker 배포 섹션을 주석 처리하여 사용.
+# 대상 서버에 Node.js 22+ 와 pm2가 설치되어 있어야 한다.
+#
+# .deploy-files:
+#   image: alpine:latest
+#   dependencies:
+#     - build
+#   before_script:
+#     - apk add --no-cache openssh-client rsync
+#     - eval $(ssh-agent -s)
+#     - echo "${SSH_PRIVATE_KEY}" | tr -d '\r' | ssh-add -
+#     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+#     - ssh-keyscan -H ${DEPLOY_HOST} >> ~/.ssh/known_hosts 2>/dev/null
+#   script:
+#     # 기존 파일 백업 (최근 5개 유지)
+#     - |
+#       ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} << 'ENDSSH'
+#         BACKUP_DIR="${DEPLOY_PATH}/backup/$(date +%Y%m%d_%H%M%S)"
+#         mkdir -p ${BACKUP_DIR}
+#         cp -r ${DEPLOY_PATH}/app/. ${BACKUP_DIR}/ 2>/dev/null || true
+#         cd ${DEPLOY_PATH}/backup && ls -dt */ | tail -n +6 | xargs rm -rf 2>/dev/null || true
+#       ENDSSH
+#     # standalone 빌드 결과물 전송
+#     - rsync -az --delete .next/standalone/ ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/app/
+#     - rsync -az --delete .next/static/ ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/app/.next/static/
+#     - rsync -az --delete public/ ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/app/public/
+#     # 서비스 재시작 (pm2)
+#     - |
+#       ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} << ENDSSH
+#         cd ${DEPLOY_PATH}/app
+#         export NEXT_PUBLIC_API_BASE_URL=${API_BASE_URL}
+#         export PORT=3000
+#         pm2 restart frontend --update-env 2>/dev/null || pm2 start server.js --name frontend
+#         pm2 save
+#         sleep 5
+#         # 헬스체크
+#         curl -sf http://localhost:3000 || echo "WARNING: 헬스체크 실패"
+#         echo "배포 완료: ${DEPLOY_HOST}"
+#       ENDSSH
+#
+# deploy:dev:files:
+#   extends: .deploy-files
+#   stage: deploy-dev
+#   environment:
+#     name: development
+#   variables:
+#     DEPLOY_HOST: ${DEV_SERVER_HOST}
+#     DEPLOY_USER: ${DEV_SERVER_USER}
+#     DEPLOY_PATH: ${DEV_DEPLOY_PATH}
+#     API_BASE_URL: ${DEV_API_BASE_URL}
+#   rules:
+#     - if: $CI_COMMIT_BRANCH == "develop"
+#       when: manual
+#
+# deploy:stg:files:
+#   extends: .deploy-files
+#   stage: deploy-stg
+#   environment:
+#     name: staging
+#   variables:
+#     DEPLOY_HOST: ${STG_SERVER_HOST}
+#     DEPLOY_USER: ${STG_SERVER_USER}
+#     DEPLOY_PATH: ${STG_DEPLOY_PATH}
+#     API_BASE_URL: ${STG_API_BASE_URL}
+#   rules:
+#     - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+#       when: manual
+#
+# deploy:prod:files:
+#   extends: .deploy-files
+#   stage: deploy-prod
+#   environment:
+#     name: production
+#   variables:
+#     DEPLOY_HOST: ${PROD_SERVER_HOST}
+#     DEPLOY_USER: ${PROD_SERVER_USER}
+#     DEPLOY_PATH: ${PROD_DEPLOY_PATH}
+#     API_BASE_URL: ${PROD_API_BASE_URL}
+#   rules:
+#     - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"
+#       when: manual
